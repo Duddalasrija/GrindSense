@@ -16,6 +16,7 @@ class GrindSession(Base):
     __tablename__="grinding_sessions"
     id=Column(String,primary_key=True); task_type=Column(String); ingredients=Column(JSON); quantity=Column(Float)
     target_texture=Column(String); smoothness_level=Column(Integer); adaptive_mode=Column(Boolean,default=True)
+    added_water_ml=Column(Float,default=0); preparation_type=Column(String,default="Wet preparation")
     simulation_scenario=Column(String,default="normal"); scenario_seed=Column(Integer,default=42)
     status=Column(String,default="created"); progress=Column(Float,default=0); tick=Column(Integer,default=0)
     speed_rpm=Column(Float,default=900); intensity=Column(Float,default=.72); pulse_pattern=Column(String,default="3s on / 1s rest")
@@ -33,6 +34,11 @@ class Event(Base):
     event_type=Column(String); previous_state=Column(JSON); new_state=Column(JSON); severity=Column(String,default="info"); explanation=Column(Text)
 
 Base.metadata.create_all(engine)
+if URL.startswith("sqlite"):
+    with engine.begin() as conn:
+        cols={row[1] for row in conn.exec_driver_sql("PRAGMA table_info(grinding_sessions)")}
+        if "added_water_ml" not in cols: conn.exec_driver_sql("ALTER TABLE grinding_sessions ADD COLUMN added_water_ml FLOAT NOT NULL DEFAULT 0")
+        if "preparation_type" not in cols: conn.exec_driver_sql("ALTER TABLE grinding_sessions ADD COLUMN preparation_type VARCHAR DEFAULT 'Wet preparation'")
 app=FastAPI(title="GrindSense Simulation API",version="1.0.0",description="Software-only prototype. Telemetry and outcomes are estimates; no hardware is connected.")
 origins=[x.strip() for x in os.getenv("GRINDSENSE_CORS_ORIGINS","http://localhost:5173").split(",")]
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_methods=["*"],allow_headers=["*"])
@@ -47,6 +53,8 @@ class Create(BaseModel):
     task_type:str=Field(default="chutney",pattern="^(chutney|masala|batter|custom)$")
     ingredients:list[str]=Field(min_length=1,max_length=12)
     quantity:float=Field(default=250,gt=0,le=2000)
+    added_water_ml:float=Field(default=0,ge=0,le=2000)
+    preparation_type:str=Field(default="Wet preparation",pattern="^(Wet preparation|Dry grinding|Blending)$")
     target_texture:str=Field(default="medium",pattern="^(coarse|medium|fine|smooth)$")
     smoothness_level:int=Field(default=50,ge=0,le=100)
     adaptive_mode:bool=True
@@ -56,7 +64,7 @@ class Scenario(BaseModel):
     scenario:str=Field(pattern="^(normal|high_load|high_temperature|high_vibration|overload)$")
     seed:int=42
 def out(s):
-    return {k:getattr(s,k) for k in ("id","task_type","ingredients","quantity","target_texture","smoothness_level","adaptive_mode","simulation_scenario","status","progress","started_at","completed_at","estimated_texture_score","result_summary")}
+    return {k:getattr(s,k) for k in ("id","task_type","ingredients","quantity","added_water_ml","preparation_type","target_texture","smoothness_level","adaptive_mode","simulation_scenario","status","progress","started_at","completed_at","estimated_texture_score","result_summary")}
 def get(db,sid):
     s=db.get(GrindSession,sid)
     if not s: raise HTTPException(404,"Session not found")
@@ -177,3 +185,28 @@ def results(sid:str):
 def configure(p:Scenario):
     scenario_default.update(scenario=p.scenario,seed=p.seed)
     return {"scenario":p.scenario,"seed":p.seed,"note":"Applied as the default for sessions created without an explicit scenario."}
+
+@app.post("/api/sessions/{sid}/pause")
+async def pause(sid:str):
+    db=DB()
+    try:
+        s=get(db,sid)
+        if s.status=="running":
+            task=tasks.get(sid)
+            if task and not task.done(): task.cancel()
+            s.status="paused"
+            add_event(db,s,"info","Simulation paused by user.")
+            db.commit()
+        return out(s)
+    finally: db.close()
+@app.post("/api/sessions/{sid}/resume")
+async def resume(sid:str):
+    db=DB()
+    try:
+        s=get(db,sid)
+        if s.status!="paused": raise HTTPException(409,"Only a paused session can be resumed.")
+        s.status="running"
+        db.commit()
+        tasks[sid]=asyncio.create_task(run(sid))
+        return out(s)
+    finally: db.close()
