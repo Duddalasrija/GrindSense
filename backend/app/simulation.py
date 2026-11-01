@@ -12,6 +12,10 @@ TEXTURE_THRESHOLDS: dict[str, float] = {
     "smooth": 94,
 }
 
+# Illustrative virtual scaling chosen so the current guardrail is reachable
+# before the separate simulated load guardrail in the overload scenario.
+MOTOR_CURRENT_PER_LOAD = 0.115
+
 
 def generate_reading(session: Any) -> dict[str, float]:
     """Generate one reproducible reading from persisted session state.
@@ -61,7 +65,7 @@ def generate_reading(session: Any) -> dict[str, float]:
     )
 
     return {
-        "motor_current": round(1.2 + load * 0.082 + rng.uniform(-0.1, 0.1), 2),
+        "motor_current": round(1.2 + load * MOTOR_CURRENT_PER_LOAD + rng.uniform(-0.1, 0.1), 2),
         "motor_load": round(load, 1),
         "temperature": round(temperature, 1),
         "vibration": round(vibration, 1),

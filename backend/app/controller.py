@@ -11,6 +11,17 @@ CRITICAL_LOAD = 96
 CRITICAL_TEMPERATURE = 88
 CRITICAL_VIBRATION = 11
 CRITICAL_CURRENT = 11.5
+PREDICTIVE_WINDOW_SIZE = 5
+PREDICTIVE_MIN_READINGS = 3
+PREDICTIVE_HORIZON_TICKS = 3
+PREDICTIVE_RESET_MARGIN = 0.05
+
+PREDICTIVE_THRESHOLDS = {
+    "motor_load": (WARN_LOAD, CRITICAL_LOAD),
+    "temperature": (WARN_TEMPERATURE, CRITICAL_TEMPERATURE),
+    "vibration": (WARN_VIBRATION, CRITICAL_VIBRATION),
+    "motor_current": (CRITICAL_CURRENT,),
+}
 
 
 @dataclass(frozen=True)
@@ -19,6 +30,47 @@ class ControlDecision:
     intensity: float
     pulse_pattern: str
     explanation: str | None
+
+
+@dataclass(frozen=True)
+class PredictiveWarning:
+    metric: str
+    threshold: float
+    slope_per_tick: float
+    estimated_ticks_to_threshold: float
+
+
+def predictive_warnings(readings: list[dict[str, float]]) -> list[PredictiveWarning]:
+    """Predict near-term approaches to configured thresholds from simulated readings.
+
+    Uses an ordinary least-squares slope over at most the latest five readings.
+    A majority-trend check filters isolated one-reading spikes; estimates are
+    demonstration signals, not physical predictions.
+    """
+    window = readings[-PREDICTIVE_WINDOW_SIZE:]
+    if len(window) < PREDICTIVE_MIN_READINGS:
+        return []
+
+    predictions = []
+    x_mean = (len(window) - 1) / 2
+    x_variance = sum((x - x_mean) ** 2 for x in range(len(window)))
+    for metric, thresholds in PREDICTIVE_THRESHOLDS.items():
+        values = [float(item[metric]) for item in window]
+        y_mean = sum(values) / len(values)
+        slope = sum((x - x_mean) * (value - y_mean) for x, value in enumerate(values)) / x_variance
+        positive_steps = sum(right > left for left, right in zip(values, values[1:]))
+        minimum_positive_steps = max(2, (len(values) - 1) // 2 + 1)
+        if slope <= 0 or positive_steps < minimum_positive_steps:
+            continue
+
+        current = values[-1]
+        for threshold in thresholds:
+            gap = threshold - current
+            ticks = gap / slope
+            if 0 < ticks <= PREDICTIVE_HORIZON_TICKS:
+                predictions.append(PredictiveWarning(metric, threshold, slope, ticks))
+                break
+    return predictions
 
 
 def adapt(session: Any, reading: dict[str, float]) -> ControlDecision:
@@ -67,6 +119,8 @@ def safety_stop_reason(reading: dict[str, float]) -> str | None:
         return "Critical simulated temperature threshold reached; session stopped safely. Demo threshold only."
     if reading["vibration"] >= CRITICAL_VIBRATION:
         return "Critical abnormal simulated vibration threshold reached; session stopped safely. Demo threshold only."
-    if reading["motor_load"] >= CRITICAL_LOAD or reading["motor_current"] >= CRITICAL_CURRENT:
+    if reading["motor_current"] >= CRITICAL_CURRENT:
+        return "Simulated motor overload: critical motor-current threshold reached; session stopped safely. Demo threshold only."
+    if reading["motor_load"] >= CRITICAL_LOAD:
         return "Simulated motor overload threshold reached; session stopped safely. Demo threshold only."
     return None
