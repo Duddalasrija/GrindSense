@@ -396,6 +396,27 @@ def test_all_safe_interlocks_allow_start(client):
     assert started.json()["status"]=="running"
     assert client.post(f"/api/sessions/{sid}/stop").json()["status"]=="stopped"
 
+def test_simulation_api_returns_acoustic_and_torque_proxy_indices(client):
+    sid=make_session(client,target="coarse")
+    assert client.post(f"/api/sessions/{sid}/start").status_code==200
+    deadline=time.time()+3
+    rows=client.get(f"/api/sessions/{sid}/telemetry").json()
+    while time.time()<deadline and not rows:
+        time.sleep(.05)
+        rows=client.get(f"/api/sessions/{sid}/telemetry").json()
+    assert rows
+    assert 0 <= rows[0]["acoustic_signature_index"] <= 120
+    assert 0 <= rows[0]["torque_demand_index"] <= 100
+    assert client.post(f"/api/sessions/{sid}/stop").status_code==200
+
+def test_high_acoustic_scenario_is_accepted(client):
+    response=client.post("/api/sessions",json={
+        "task_type":"chutney","ingredients":["coconut"],
+        "simulation_scenario":"high_acoustic"
+    })
+    assert response.status_code==201, response.text
+    assert response.json()["simulation_scenario"]=="high_acoustic"
+
 @pytest.mark.parametrize(
     ("unsafe_state","reason"),
     [
@@ -664,6 +685,7 @@ def force_tick(sid, tick):
 def virtual_reading(**updates):
     values={
         "motor_current":5.0,"motor_load":60.0,"temperature":40.0,"vibration":3.0,
+        "acoustic_signature_index":45.0,"torque_demand_index":43.0,
         "motor_speed":650.0,"texture_index":20.0,"progress":10.0,
     }
     values.update(updates)

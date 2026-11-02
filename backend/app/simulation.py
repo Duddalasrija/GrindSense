@@ -48,10 +48,22 @@ def generate_reading(session: Any) -> dict[str, float]:
         temperature += session.tick * 0.43
     if session.simulation_scenario == "high_vibration":
         vibration += min(9.5, session.tick * 0.38)
+    if session.simulation_scenario == "high_acoustic":
+        load += min(18, session.tick * 0.55)
     if session.simulation_scenario == "overload":
         load += min(65, session.tick * 2.7)
 
     load = max(8, min(110, load))
+    acoustic_signature_index = max(
+        0,
+        min(
+            120,
+            22 + load * 0.2 + vibration * 2 + session.intensity * 8
+            + (min(48, session.tick * 1.8) if session.simulation_scenario == "high_acoustic" else 0)
+            + rng.uniform(-1.5, 1.5),
+        ),
+    )
+    torque_demand_index = max(0, min(100, load * session.intensity))
     progress = min(
         100,
         session.progress
@@ -69,6 +81,8 @@ def generate_reading(session: Any) -> dict[str, float]:
         "motor_load": round(load, 1),
         "temperature": round(temperature, 1),
         "vibration": round(vibration, 1),
+        "acoustic_signature_index": round(acoustic_signature_index, 1),
+        "torque_demand_index": round(torque_demand_index, 1),
         "motor_speed": round(max(300, session.speed_rpm * session.intensity + rng.uniform(-12, 12))),
         "texture_index": round(texture_index, 1),
         "progress": round(progress, 1),

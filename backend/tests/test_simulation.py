@@ -30,6 +30,8 @@ def reading(**overrides):
         "motor_load": 60.0,
         "temperature": 40.0,
         "vibration": 3.0,
+        "acoustic_signature_index": 45.0,
+        "torque_demand_index": 43.0,
         "motor_speed": 650.0,
         "texture_index": 20.0,
         "progress": 10.0,
@@ -42,11 +44,21 @@ def test_normal_grinding_generates_complete_telemetry():
     result = generate_reading(session())
     assert set(result) == {
         "motor_current", "motor_load", "temperature", "vibration",
-        "motor_speed", "texture_index", "progress",
+        "acoustic_signature_index", "torque_demand_index", "motor_speed",
+        "texture_index", "progress",
     }
     assert 8 <= result["motor_load"] <= 110
     assert result["motor_current"] > 0
+    assert 0 <= result["acoustic_signature_index"] <= 120
+    assert 0 <= result["torque_demand_index"] <= 100
     assert result["progress"] > 0
+
+
+def test_high_acoustic_scenario_increases_simulated_signature_and_warns():
+    normal = generate_reading(session(tick=30))
+    loud = generate_reading(session(tick=30, simulation_scenario="high_acoustic"))
+    assert loud["acoustic_signature_index"] > normal["acoustic_signature_index"]
+    assert any(key == "acoustic" for key, _ in warning_reasons(loud))
 
 
 def test_high_load_scenario_increases_load_and_warns():
@@ -105,6 +117,14 @@ def test_vibration_adaptation_reduces_intensity_and_shortens_pulses():
     assert decision.pulse_pattern == "1s on / 2s rest"
 
 
+def test_acoustic_adaptation_reduces_drive_and_uses_shorter_pulses():
+    decision = adapt(session(), reading(acoustic_signature_index=70))
+    assert decision.speed_rpm == 820
+    assert decision.intensity == 0.38
+    assert decision.pulse_pattern == "1s on / 2s rest"
+    assert "acoustic signature" in decision.explanation.lower()
+
+
 @pytest.mark.parametrize(
     ("values", "expected"),
     [
@@ -134,6 +154,7 @@ def test_unknown_texture_is_rejected():
         ("motor_load", [72, 74, 76], 78),
         ("temperature", [66, 68, 70], 72),
         ("vibration", [5.5, 5.9, 6.4], 7),
+        ("acoustic_signature_index", [62, 64, 66], 68),
         ("motor_current", [9.5, 10.0, 10.7], 11.5),
     ],
 )
@@ -199,5 +220,27 @@ def test_existing_sqlite_session_rows_get_safe_interlock_defaults():
                 "SELECT jar_present, lid_locked, attachment_present FROM grinding_sessions WHERE id='legacy-session'"
             ).one()
         assert values == (1, 1, 1)
+    finally:
+        legacy_engine.dispose()
+
+
+def test_existing_sqlite_telemetry_gets_new_simulated_metric_columns():
+    from app.main import ensure_sqlite_telemetry_columns
+
+    legacy_engine = create_engine("sqlite://")
+    try:
+        with legacy_engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE telemetry_records (id INTEGER PRIMARY KEY, motor_load FLOAT)"
+            )
+        ensure_sqlite_telemetry_columns(legacy_engine)
+        with legacy_engine.begin() as connection:
+            columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(telemetry_records)")}
+            connection.exec_driver_sql("INSERT INTO telemetry_records (motor_load) VALUES (40)")
+            values = connection.exec_driver_sql(
+                "SELECT acoustic_signature_index, torque_demand_index FROM telemetry_records"
+            ).one()
+        assert {"acoustic_signature_index", "torque_demand_index"} <= columns
+        assert values == (0, 0)
     finally:
         legacy_engine.dispose()

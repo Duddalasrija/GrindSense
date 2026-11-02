@@ -15,7 +15,7 @@ uvicorn app.main:app --reload
 
 The API listens at `http://localhost:8000`. Interactive Swagger documentation is at `http://localhost:8000/docs`; the OpenAPI schema is at `http://localhost:8000/openapi.json`.
 
-The default SQLite database is `backend/grindsense.db` when the app is started from `backend/`. Do not point `GRINDSENSE_DATABASE_URL` at a database you want to preserve during experiments. Existing SQLite databases receive backward-compatible session columns at startup for water, preparation, and the three simulated interlocks.
+The default SQLite database is `backend/grindsense.db` when the app is started from `backend/`. Do not point `GRINDSENSE_DATABASE_URL` at a database you want to preserve during experiments. Existing SQLite databases receive backward-compatible session columns at startup for water, preparation, and the three simulated interlocks, plus telemetry columns for the simulated acoustic-signature and torque-demand proxies.
 
 ### Environment settings
 
@@ -102,7 +102,7 @@ The JSON response examples below omit timestamps and some nullable fields where 
 | `target_texture` | string | `medium`; `coarse`, `medium`, `fine`, `smooth` |
 | `smoothness_level` | integer | `50`; 0–100 |
 | `adaptive_mode` | boolean | `true` |
-| `simulation_scenario` | string | `normal`; `normal`, `high_load`, `high_temperature`, `high_vibration`, `overload` |
+| `simulation_scenario` | string | `normal`; `normal`, `high_load`, `high_temperature`, `high_vibration`, `high_acoustic`, `overload` |
 | `scenario_seed` | integer | `42` |
 
 Example request:
@@ -190,13 +190,15 @@ Lifecycle-control endpoints (`start`, `pause`, `resume`, and `stop`) take no req
   "motor_load": 60.4,
   "temperature": 31.2,
   "vibration": 3.1,
+  "acoustic_signature_index": 47.8,
+  "torque_demand_index": 43.5,
   "motor_speed": 648.0,
   "texture_index": 1.7,
   "progress": 1.8
 }
 ```
 
-Readings are generated in `app/simulation.py`. A session seed and tick initialize deterministic variation, so the same scenario, seed, and session state generate repeatable telemetry. Scenarios adjust virtual load, temperature, or vibration. In the `overload` scenario, the regression test uses seed `19` to demonstrate a motor-current prediction and current-triggered stop before the separate load critical threshold. Current is generated as `1.2 + simulated_load × 0.115` plus deterministic variation in `[-0.1, 0.1]`; this illustrative relation is not an electrical model.
+Readings are generated in `app/simulation.py`. A session seed and tick initialize deterministic variation, so the same scenario, seed, and session state generate repeatable telemetry. Scenarios adjust virtual load, temperature, vibration, or acoustic signature. `acoustic_signature_index` is a unitless simulated proxy derived from load, vibration, intensity, and deterministic variation; it is not a microphone recording or measured sound level. `torque_demand_index` is a unitless simulated proxy based on load and intensity; it is not physical torque. In the `high_acoustic` scenario, simulated load and acoustic signature are raised. In the `overload` scenario, the regression test uses seed `19` to demonstrate a motor-current prediction and current-triggered stop before the separate load critical threshold. Current is generated as `1.2 + simulated_load × 0.115` plus deterministic variation in `[-0.1, 0.1]`; this illustrative relation is not an electrical model.
 
 `GET /api/sessions/{sid}/results` returns the session fields plus:
 
@@ -205,16 +207,18 @@ Readings are generated in `app/simulation.py`. A session seed and tick initializ
   "duration_seconds": 12.0,
   "max_motor_load": 78.4,
   "max_temperature": 35.1,
+  "max_acoustic_signature_index": 58.2,
+  "max_torque_demand_index": 56.1,
   "adaptive_actions": 2,
   "telemetry": []
 }
 ```
 
-`telemetry` has the same reading objects as the telemetry endpoint. Duration is null if either start or completion time is unset. The route can be called for any existing session and summarizes whatever readings are stored at that time.
+`telemetry` has the same reading objects as the telemetry endpoint. Duration is null if either start or completion time is unset. The route can be called for any existing session and summarizes whatever readings are stored at that time. Acoustic-signature and torque-demand maxima are simulated proxy indices, not measured sound or physical torque.
 
 ## Adaptive control, texture targets, and safety
 
-`app/controller.py` makes adaptive decisions from each simulated reading. Its priority is temperature, then load, then vibration. Depending on the simulated reading and session state it changes simulated speed and intensity, selects a pulse pattern, and records an `adaptive` event with an explanation. Low load with low progress can raise intensity gradually. Predictive warnings themselves do not modify controls or session state.
+`app/controller.py` makes adaptive decisions from each simulated reading. Its priority is temperature, then load, then vibration, then acoustic signature. When the acoustic-signature index reaches its warning threshold, the controller can reduce simulated intensity and speed and use a shorter pulse pattern. Depending on the simulated reading and session state it changes simulated speed and intensity, selects a pulse pattern, and records an `adaptive` event with an explanation. Low load with low progress can raise intensity gradually. Predictive warnings themselves do not modify controls or session state.
 
 Texture completion uses the estimated texture index and these backend-owned minimum thresholds:
 
@@ -227,11 +231,11 @@ Texture completion uses the estimated texture index and these backend-owned mini
 
 `smoothness_level` influences generated texture progression but does not replace these target thresholds.
 
-Warning thresholds are load `78`, temperature `72`, and vibration `7`. Critical simulated stops occur at load `96`, motor current `11.5`, temperature `88`, or vibration `11`. Threshold checks run on each current reading; critical safety stops take precedence over texture completion. Values are illustrative software parameters only, not validated limits for a real appliance.
+Warning thresholds are load `78`, temperature `72`, vibration `7`, and acoustic-signature index `68`. Critical simulated stops occur at load `96`, motor current `11.5`, temperature `88`, or vibration `11`; there is no acoustic-signature critical stop threshold. Threshold checks run on each current reading; critical safety stops take precedence over texture completion. Values are illustrative software parameters only, not validated limits for a real appliance.
 
 ## Predictive anomaly warnings
 
-Predictive analysis uses only simulated motor load, temperature, vibration, and current. It considers at most the latest five readings and requires three. A least-squares slope and a multi-step rising trend check estimate whether an existing warning or critical threshold may be reached within three simulation ticks. Current has a critical threshold but no separate warning threshold, so its critical value is used.
+Predictive analysis uses only simulated motor load, temperature, vibration, acoustic-signature index, and current. It considers at most the latest five readings and requires three. A least-squares slope and a multi-step rising trend check estimate whether an existing warning or critical threshold may be reached within three simulation ticks. The acoustic-signature index uses its existing warning threshold of `68`. Current has a critical threshold but no separate warning threshold, so its critical value is used.
 
 Qualifying predictions generate a separate `predictive_warning` event with `warning` severity. A metric remains deduplicated until its value recovers at least 5% below its lowest configured threshold; a `predictive_recovery` event with `info` severity records re-arming. Deduplication is per session and metric. Predictive events do not suppress real-time threshold warning or safety checks. These are short-term estimates from generated values, not validated physical appliance predictions.
 
@@ -301,7 +305,7 @@ Response:
 }
 ```
 
-Allowed scenarios are `normal`, `high_load`, `high_temperature`, `high_vibration`, and `overload`.
+Allowed scenarios are `normal`, `high_load`, `high_temperature`, `high_vibration`, `high_acoustic`, and `overload`. The `high_acoustic` scenario raises the simulated acoustic-signature proxy and associated simulated load; it does not capture or measure sound.
 
 ## Errors
 
