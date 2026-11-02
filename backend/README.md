@@ -68,7 +68,7 @@ python -m pytest -q
 | `POST /api/sessions/{sid}/start` | Start a created session, or start a paused session if safe | Session object |
 | `POST /api/sessions/{sid}/pause` | Pause a running session | Session object |
 | `POST /api/sessions/{sid}/resume` | Resume a paused session if safe | Session object |
-| `POST /api/sessions/{sid}/stop` | Manually stop a running session | Session object |
+| `POST /api/sessions/{sid}/stop` | Manually stop a running or paused session | Session object |
 | `POST /api/sessions/{sid}/interlocks` | Update all three simulated component states | Session object |
 | `GET /api/sessions/{sid}/telemetry` | Retrieve generated readings | Array of telemetry objects |
 | `GET /api/sessions/{sid}/events` | Retrieve recorded events | Array of event objects |

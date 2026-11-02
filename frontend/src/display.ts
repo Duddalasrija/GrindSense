@@ -43,6 +43,10 @@ export function unsafeInterlockLabels(state: InterlockState): string[] {
   return INTERLOCK_OPTIONS.filter(option=>!state[option.key]).map(option=>option.label);
 }
 
+export function safeEventSeverity(value: unknown): string {
+  return typeof value === "string" && value.trim().length > 0 ? value : "Info";
+}
+
 export function adaptivePulsePattern(eventType: string, newState: Record<string, unknown> | null | undefined): string | null {
   if(eventType!=="adaptive")return null;
   const pattern=newState?.pulse_pattern;

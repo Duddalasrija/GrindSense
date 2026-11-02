@@ -65,3 +65,11 @@ test("adaptive pulse patterns are returned only for valid adaptive event values"
   assert.equal(helpers.adaptivePulsePattern("adaptive", { pulse_pattern: 42 }), null);
   assert.equal(helpers.adaptivePulsePattern("info", { pulse_pattern: "ignored" }), null);
 });
+
+test("event severity safely handles absent and invalid backend values", () => {
+  assert.equal(helpers.safeEventSeverity("critical"), "critical");
+  assert.equal(helpers.safeEventSeverity("future-level"), "future-level");
+  assert.equal(helpers.safeEventSeverity(null), "Info");
+  assert.equal(helpers.safeEventSeverity(42), "Info");
+  assert.equal(helpers.safeEventSeverity("  "), "Info");
+});

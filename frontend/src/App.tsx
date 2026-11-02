@@ -1,6 +1,6 @@
 import {useCallback,useEffect,useState,type CSSProperties,type ReactNode} from "react";
 import{api,type Event,type InterlockState,type Reading,type Results,type Session}from"./api";
-import{adaptivePulsePattern,elapsedSeconds,formatDuration,INTERLOCK_OPTIONS,parseBackendTimestamp,textureScoreRange,unsafeInterlockLabels,updateInterlockState}from"./display";
+import{adaptivePulsePattern,elapsedSeconds,formatDuration,INTERLOCK_OPTIONS,parseBackendTimestamp,safeEventSeverity,textureScoreRange,unsafeInterlockLabels,updateInterlockState}from"./display";
 import "./events.css";
 type Page="setup"|"live"|"history"|"results"|"library";
 type Scenario="normal"|"high_load"|"high_temperature"|"high_vibration"|"high_acoustic"|"overload";
@@ -24,7 +24,8 @@ const eventLabel=(type:string,context:"live"|"results")=>{
 };
 function EventBadges({event,context}:{event:Event;context:"live"|"results"}){
  const kind=event.event_type==="predictive_warning"?" predictive-warning":event.event_type==="predictive_recovery"?" predictive-recovery":"";
- return <span className="event-badges"><b className={"event-kind"+kind}>{eventLabel(event.event_type,context)}</b><span className={"event-severity severity-"+event.severity.toLowerCase()}>{event.severity}</span></span>;
+ const severity=safeEventSeverity(event.severity);
+ return <span className="event-badges"><b className={"event-kind"+kind}>{eventLabel(event.event_type,context)}</b><span className={"event-severity severity-"+severity.toLowerCase()}>{severity}</span></span>;
 }
 function EventPulsePattern({event}:{event:Event}){
  const pattern=adaptivePulsePattern(event.event_type,event.new_state);
@@ -41,13 +42,13 @@ function App(){
  const poll=useCallback(async(sid:string)=>{try{const[s,t,v]=await Promise.all([api.session(sid),api.telemetry(sid),api.events(sid)]);setSession(s);setReadings(t);setEvents(v);if(["completed","safety_stopped","stopped"].includes(s.status)){setPage("results");setResult(await api.results(sid));void refreshHistory()}}catch(e){setError(e instanceof Error?e.message:"Could not update session")}},[refreshHistory]);
  useEffect(()=>{if(page!=="live"||!id)return;void poll(id);const timer=setInterval(()=>void poll(id),1000);return()=>clearInterval(timer)},[page,id,poll]);
  const start=async()=>{setBusy(true);setError("");try{const r=recipes[recipe];const s=await api.create({task_type:r.task,ingredients:r.ingredients,quantity:quantity,added_water_ml:water,preparation_type:prep,target_texture:texture,smoothness_level:smooth,adaptive_mode:adaptive,simulation_scenario:scenario,scenario_seed:Math.floor(Math.random()*1e6)});setId(s.id);setSession(s);setReadings([]);setEvents([]);setResult(null);await api.start(s.id);setPage("live")}catch(e){setError(e instanceof Error?e.message:"Could not start simulation")}finally{setBusy(false)}};
- const stop=async()=>{if(id){await api.stop(id);await poll(id)}};
- const open=async(s:Session)=>{setId(s.id);setSession(s);if(["completed","safety_stopped","stopped"].includes(s.status)){setResult(await api.results(s.id));setEvents(await api.events(s.id));setPage("results")}else setPage("live")};
+ const stop=async()=>{if(!id)return;try{await api.stop(id);await poll(id)}catch(e){setError(e instanceof Error?e.message:"Could not stop simulation")}};
+ const open=async(s:Session)=>{try{setId(s.id);setSession(s);if(["completed","safety_stopped","stopped"].includes(s.status)){setResult(await api.results(s.id));setEvents(await api.events(s.id));setPage("results")}else setPage("live")}catch(e){setError(e instanceof Error?e.message:"Could not load session")}};
  const props={page,setPage};
  return <div className="app-shell"><Sidebar {...props} health={health}/><div className="workspace"><header className="topbar"><div className="crumb"><span>Workspace</span><b>/</b><strong>{page==="setup"?"New simulation":page==="live"?"Live session":page==="results"?"Session results":page==="history"?"Session history":"Texture library"}</strong></div><div className="top-right"><span className="sim-pill"><i/>Simulation mode</span><span className="device">No device connected or required</span><span className="avatar">AQ</span></div></header>
  {backendError&&<div className="notice">Backend unavailable: {backendError}. Start FastAPI to load sessions and simulated telemetry.</div>}{error&&<div className="notice error" role="alert">{error}<button onClick={()=>setError("")}>×</button></div>}
  {page==="setup"&&<Setup recipe={recipe} setRecipe={v=>{setRecipe(v);setWater(recipes[v].water)}} quantity={quantity} setQuantity={setQuantity} water={water} setWater={setWater} texture={texture} setTexture={setTexture} smooth={smooth} setSmooth={setSmooth} adaptive={adaptive} setAdaptive={setAdaptive} scenario={scenario} setScenario={setScenario} prep={prep} setPrep={setPrep} start={start} busy={busy} count={sessions.length+1}/>}
- {page==="live"&&<Live session={session} readings={readings} events={events} stop={stop} refresh={()=>poll(id)}/>}
+ {page==="live"&&<Live session={session} readings={readings} events={events} stop={stop} refresh={()=>poll(id)} onError={message=>setError(message)}/>}
  {page==="history"&&<History sessions={sessions} open={open} newSession={()=>setPage("setup")}/>}
  {page==="results"&&<ResultsPage result={result} events={events} refine={()=>setPage("setup")} repeat={()=>{setId("");setResult(null);setPage("setup")}}/>}
  {page==="library"&&<Library select={()=>setPage("setup")}/>}
@@ -111,7 +112,7 @@ function Chart({rows,field}:{rows:Reading[];field:"motor_load"|"vibration"|"temp
  return <svg className="chart" viewBox="0 0 330 136" role="img" aria-label={field.replace("_"," ")+" simulated readings"}><path d="M28 12V116H316" fill="none" stroke="#e7ebe5"/>{[.25,.5,.75,1].map(x=><line key={x} x1="28" x2="316" y1={116-104*x} y2={116-104*x} stroke="#edf0eb"/>)}<path d={path?path+" L 316 116 L 28 116 Z":""} fill="rgba(21,150,103,.08)"/><path d={path} fill="none" stroke="#159667" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>{pts.length>0&&<circle cx={pts.at(-1)![0]} cy={pts.at(-1)![1]} r="3" fill="#159667"/>}</svg>;
 }
 function Metric({label,value,unit,foot,icon}:{label:string;value:string;unit?:string;foot:string;icon:string}){return <div className="metric"><div><span>{label}</span><Icon name={icon} size={14}/></div><strong>{value}<small>{unit}</small></strong><p>{foot}</p></div>}
-function Live({session,readings,events,stop,refresh}:{session:Session|null;readings:Reading[];events:Event[];stop:()=>void;refresh:()=>Promise<void>}){
+function Live({session,readings,events,stop,refresh,onError}:{session:Session|null;readings:Reading[];events:Event[];stop:()=>void;refresh:()=>Promise<void>;onError:(message:string)=>void}){
  const latest=readings.at(-1),seconds=elapsedSeconds(session?.started_at);
  const isPaused=session?.status==="paused";
  const [interlockBusy,setInterlockBusy]=useState(false),[interlockError,setInterlockError]=useState("");
@@ -119,7 +120,7 @@ function Live({session,readings,events,stop,refresh}:{session:Session|null;readi
  const unsafeComponents=unsafeInterlockLabels(interlocks);
  const isTerminal=["completed","stopped","safety_stopped"].includes(session?.status||"");
  const latestAlert=[...events].reverse().find(e=>["warning","predictive_warning"].includes(e.event_type));
- const togglePause=async()=>{if(!session)return;await (isPaused?api.resume(session.id):api.pause(session.id));refresh()};
+ const togglePause=async()=>{if(!session)return;try{await (isPaused?api.resume(session.id):api.pause(session.id));await refresh()}catch(e){onError(e instanceof Error?e.message:"Could not update session state")}};
  const changeInterlock=async(key:keyof InterlockState,value:boolean)=>{
   if(!session)return;
   setInterlockError("");setInterlockBusy(true);
