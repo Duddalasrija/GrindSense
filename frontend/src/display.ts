@@ -1,3 +1,5 @@
+import type {InterlockState} from "./api";
+
 /** Display helpers for backend values that may be serialized without timezone info. */
 export function parseBackendTimestamp(value: string | null | undefined): number {
   if (!value) return Number.NaN;
@@ -23,4 +25,26 @@ export function textureScoreRange(texture: string, smoothness: number): string {
   const minimum = Math.max(0, Math.min(100, smoothness - 3));
   const maximum = Math.max(minimum, Math.min(100, smoothness + 3));
   return `${minimum}–${maximum} / 100`;
+}
+
+export type InterlockKey = keyof InterlockState;
+
+export const INTERLOCK_OPTIONS: {key: InterlockKey; label: string; safeLabel: string; unsafeLabel: string}[] = [
+  {key:"jar_present",label:"Jar present",safeLabel:"Present",unsafeLabel:"Missing"},
+  {key:"lid_locked",label:"Lid locked",safeLabel:"Locked",unsafeLabel:"Unlocked"},
+  {key:"attachment_present",label:"Attachment present",safeLabel:"Present",unsafeLabel:"Missing"},
+];
+
+export function updateInterlockState(state: InterlockState, key: InterlockKey, value: boolean): InterlockState {
+  return {...state,[key]:value};
+}
+
+export function unsafeInterlockLabels(state: InterlockState): string[] {
+  return INTERLOCK_OPTIONS.filter(option=>!state[option.key]).map(option=>option.label);
+}
+
+export function adaptivePulsePattern(eventType: string, newState: Record<string, unknown> | null | undefined): string | null {
+  if(eventType!=="adaptive")return null;
+  const pattern=newState?.pulse_pattern;
+  return typeof pattern==="string"&&pattern.trim().length>0?pattern:null;
 }

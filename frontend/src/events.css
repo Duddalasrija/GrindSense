@@ -7,4 +7,5 @@
 .event-severity.severity-critical{background:#fde8e4;color:#963d32}
 .event-severity.severity-info{background:#e8f4eb;color:#256448}
 .event-summary{display:grid;gap:5px}
+.event-pulse{font-size:8px;color:#526258;line-height:1.4}
 .safety-bar .event-badges{display:inline-flex;vertical-align:middle}
