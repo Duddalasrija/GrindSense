@@ -1,5 +1,7 @@
 # GrindSense Round 2 status and handoff
 
+> **Update 2 November 2026:** The software changes and CAD progress are committed on GitHub `main` (latest CAD commit `4650b86`). Backend tests passed (58), frontend build passed, and frontend display tests passed (9). The four SolidWorks part documents are mesh-body imports, not editable feature-based solids. The assembly contains the combined concept as one fixed component; the individual parts are not mated together and there is no native exploded configuration. The exploded STL and annotated SVG are useful concept visuals, not proof of a completed SolidWorks assembly. No final hackathon video or genuine SolidWorks screenshots are included yet.
+
 ## Scope
 
 This review follows the owner-approved Track 3 mixer-grinder concept. It describes an outcome-driven cycle: choose coarse, medium, fine, or smooth; sense; interpret; adapt; verify; stop. Proposed inputs include motor current, vibration, acoustic signature, temperature, and jar/lid/attachment state. The current project is a software simulation only.
@@ -30,7 +32,7 @@ All sensor values, thresholds, warnings, texture scores, adaptive actions, inter
 1. Demo the four outcomes and the normal, high-acoustic, and overload scenarios; capture dated screenshots or a recording of actual runs and note the scenario used.
 2. Check pause/resume/stop, each interlock, warning, results, and history in the running UI; report untested flows honestly.
 3. Obtain Sahithi's exact latest frontend branch/commit and review its diff before integration. The contributor-linked repository currently exposes only its older `main`; no newer frontend work was found.
-4. Finish the conceptual CAD package (housing, jar, blade, lid, assembly, exploded view, proposed sensing/interlock locations) and capture genuine CAD screenshots. CAD is unfinished and no sensor installation should be implied.
+4. Improve the CAD only when design work resumes: build editable parts, mate the four components, create an exploded configuration, and capture genuine SolidWorks screenshots. Until then, describe it as mesh-based concept progress; do not call it a completed assembly or imply proposed sensors are installed.
 5. Keep a concise limitations slide/report in the submission and preserve the no-hardware disclaimer.
 
 ## Round 3 / later validation
