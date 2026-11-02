@@ -23,6 +23,10 @@ test("smoothness score range stays within its upper bound", () => {
   assert.equal(helpers.textureScoreRange("smooth", 100), "97–100 / 100");
 });
 
+test("fine texture range matches the simulated fine completion target", () => {
+  assert.equal(helpers.textureScoreRange("fine", 92), "72–80 / 100");
+});
+
 test("backend naive timestamps are parsed as UTC, not local time", () => {
   assert.equal(helpers.parseBackendTimestamp("2026-06-01T12:00:00"), Date.UTC(2026, 5, 1, 12));
 });

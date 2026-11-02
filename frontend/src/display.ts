@@ -19,6 +19,7 @@ export function formatDuration(seconds: number | null | undefined): string {
 export function textureScoreRange(texture: string, smoothness: number): string {
   if (texture === "coarse") return "24–34 / 100";
   if (texture === "medium") return "48–58 / 100";
+  if (texture === "fine") return "72–80 / 100";
   const minimum = Math.max(0, Math.min(100, smoothness - 3));
   const maximum = Math.max(minimum, Math.min(100, smoothness + 3));
   return `${minimum}–${maximum} / 100`;

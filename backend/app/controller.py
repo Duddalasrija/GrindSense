@@ -7,6 +7,7 @@ from typing import Any
 WARN_LOAD = 78
 WARN_TEMPERATURE = 72
 WARN_VIBRATION = 7
+WARN_ACOUSTIC = 68
 CRITICAL_LOAD = 96
 CRITICAL_TEMPERATURE = 88
 CRITICAL_VIBRATION = 11
@@ -20,6 +21,7 @@ PREDICTIVE_THRESHOLDS = {
     "motor_load": (WARN_LOAD, CRITICAL_LOAD),
     "temperature": (WARN_TEMPERATURE, CRITICAL_TEMPERATURE),
     "vibration": (WARN_VIBRATION, CRITICAL_VIBRATION),
+    "acoustic_signature_index": (WARN_ACOUSTIC,),
     "motor_current": (CRITICAL_CURRENT,),
 }
 
@@ -94,6 +96,11 @@ def adapt(session: Any, reading: dict[str, float]) -> ControlDecision:
         intensity = 0.38
         pulse = "1s on / 2s rest"
         message = "Abnormal simulated vibration detected. Reducing intensity and using shorter pulses."
+    elif reading["acoustic_signature_index"] >= WARN_ACOUSTIC and intensity > 0.4:
+        intensity = 0.38
+        speed = max(420, speed - 80)
+        pulse = "1s on / 2s rest"
+        message = "Elevated simulated acoustic signature. Reducing drive intensity and using shorter pulses."
     elif reading["motor_load"] < 62 and session.progress < 70 and intensity < 0.82:
         intensity = min(0.82, intensity + 0.04)
         message = "Load is stable and texture progress is low. Gradually increasing simulated intensity."
@@ -110,6 +117,8 @@ def warning_reasons(reading: dict[str, float]) -> list[tuple[str, str]]:
         warnings.append(("temperature", "Simulated temperature warning; demonstration threshold only."))
     if reading["vibration"] >= WARN_VIBRATION:
         warnings.append(("vibration", "Abnormal simulated vibration warning; demonstration threshold only."))
+    if reading["acoustic_signature_index"] >= WARN_ACOUSTIC:
+        warnings.append(("acoustic", "Elevated simulated acoustic signature warning; demonstration threshold only."))
     return warnings
 
 

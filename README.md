@@ -1,6 +1,6 @@
 # GrindSense — From Speed Control to Outcome Control
 
-GrindSense is a software-only innovation prototype for adaptive grinding. No physical mixer-grinder, motor controller, or sensors are connected. Telemetry, texture scores, warning limits, and outcomes are simulated estimates.
+GrindSense is a software-only innovation prototype for adaptive grinding. A user selects coarse, medium, fine, or smooth. The simulation uses generated motor-current, load, vibration, temperature, acoustic-signature, and torque-demand proxy values to explain adaptive speed, intensity, pulsing, warnings, and stops. No physical mixer-grinder, motor controller, microphone, or sensors are connected. Telemetry, texture scores, warning limits, torque-demand indices, and outcomes are simulated estimates.
 
 ## Frontend
 

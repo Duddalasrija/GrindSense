@@ -39,7 +39,10 @@ class GrindSession(Base):
 class Telemetry(Base):
     __tablename__="telemetry_records"
     id=Column(Integer,primary_key=True); session_id=Column(ForeignKey("grinding_sessions.id"),index=True); timestamp=Column(DateTime(timezone=True),default=now)
-    motor_current=Column(Float); motor_load=Column(Float); temperature=Column(Float); vibration=Column(Float); motor_speed=Column(Float); texture_index=Column(Float); progress=Column(Float)
+    motor_current=Column(Float); motor_load=Column(Float); temperature=Column(Float); vibration=Column(Float)
+    acoustic_signature_index=Column(Float,default=0,nullable=False,server_default="0")
+    torque_demand_index=Column(Float,default=0,nullable=False,server_default="0")
+    motor_speed=Column(Float); texture_index=Column(Float); progress=Column(Float)
 class Event(Base):
     __tablename__="session_events"
     id=Column(Integer,primary_key=True); session_id=Column(ForeignKey("grinding_sessions.id"),index=True); timestamp=Column(DateTime(timezone=True),default=now)
@@ -61,6 +64,21 @@ def ensure_sqlite_session_columns(database_engine):
             if name not in cols:
                 conn.exec_driver_sql(f"ALTER TABLE grinding_sessions ADD COLUMN {name} {definition}")
 if URL.startswith("sqlite"): ensure_sqlite_session_columns(engine)
+def ensure_sqlite_telemetry_columns(database_engine):
+    """Add simulated acoustic and torque-proxy fields to existing SQLite telemetry."""
+    with database_engine.begin() as conn:
+        tables={row[0] for row in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "telemetry_records" not in tables:
+            return
+        cols={row[1] for row in conn.exec_driver_sql("PRAGMA table_info(telemetry_records)")}
+        additions={
+            "acoustic_signature_index":"FLOAT NOT NULL DEFAULT 0",
+            "torque_demand_index":"FLOAT NOT NULL DEFAULT 0",
+        }
+        for name,definition in additions.items():
+            if name not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE telemetry_records ADD COLUMN {name} {definition}")
+if URL.startswith("sqlite"): ensure_sqlite_telemetry_columns(engine)
 app=FastAPI(title="GrindSense Simulation API",version="1.0.0",description="Software-only prototype. Telemetry and outcomes are estimates; no hardware is connected.")
 origins=[x.strip() for x in os.getenv("GRINDSENSE_CORS_ORIGINS","http://localhost:5173").split(",")]
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_methods=["*"],allow_headers=["*"])
@@ -80,10 +98,10 @@ class Create(BaseModel):
     target_texture:str=Field(default="medium",pattern="^(coarse|medium|fine|smooth)$")
     smoothness_level:int=Field(default=50,ge=0,le=100)
     adaptive_mode:bool=True
-    simulation_scenario:str=Field(default="normal",pattern="^(normal|high_load|high_temperature|high_vibration|overload)$")
+    simulation_scenario:str=Field(default="normal",pattern="^(normal|high_load|high_temperature|high_vibration|high_acoustic|overload)$")
     scenario_seed:int=42
 class Scenario(BaseModel):
-    scenario:str=Field(pattern="^(normal|high_load|high_temperature|high_vibration|overload)$")
+    scenario:str=Field(pattern="^(normal|high_load|high_temperature|high_vibration|high_acoustic|overload)$")
     seed:int=42
 class InterlockUpdate(BaseModel):
     jar_present:bool
@@ -185,7 +203,7 @@ def advance(db,s):
         .all()
     )
     recent_readings=[
-        {key:getattr(row,key) for key in ("motor_load","temperature","vibration","motor_current")}
+        {key:getattr(row,key) for key in ("motor_load","temperature","vibration","motor_current","acoustic_signature_index")}
         for row in reversed(previous_rows)
     ]
     recent_readings.append(r)
@@ -255,7 +273,7 @@ def stop(sid:str):
 @app.get("/api/sessions/{sid}/telemetry")
 def telemetry(sid:str):
     db=DB()
-    try:get(db,sid);return [{k:getattr(r,k) for k in ("timestamp","motor_current","motor_load","temperature","vibration","motor_speed","texture_index","progress")} for r in db.query(Telemetry).filter_by(session_id=sid).order_by(Telemetry.id)]
+    try:get(db,sid);return [{k:getattr(r,k) for k in ("timestamp","motor_current","motor_load","temperature","vibration","acoustic_signature_index","torque_demand_index","motor_speed","texture_index","progress")} for r in db.query(Telemetry).filter_by(session_id=sid).order_by(Telemetry.id)]
     finally:db.close()
 @app.get("/api/sessions/{sid}/events")
 def events(sid:str):
@@ -269,7 +287,9 @@ def results(sid:str):
         s=get(db,sid);rows=db.query(Telemetry).filter_by(session_id=sid).order_by(Telemetry.id).all()
         return {**out(s),"duration_seconds":(s.completed_at.replace(tzinfo=timezone.utc)-s.started_at.replace(tzinfo=timezone.utc)).total_seconds() if s.completed_at and s.started_at else None,
           "max_motor_load":max((x.motor_load for x in rows),default=0),"max_temperature":max((x.temperature for x in rows),default=0),
-          "adaptive_actions":db.query(Event).filter_by(session_id=sid,event_type="adaptive").count(),"telemetry":[{k:getattr(x,k) for k in ("timestamp","motor_current","motor_load","temperature","vibration","motor_speed","texture_index","progress")} for x in rows]}
+          "max_acoustic_signature_index":max((x.acoustic_signature_index for x in rows),default=0),
+          "max_torque_demand_index":max((x.torque_demand_index for x in rows),default=0),
+          "adaptive_actions":db.query(Event).filter_by(session_id=sid,event_type="adaptive").count(),"telemetry":[{k:getattr(x,k) for k in ("timestamp","motor_current","motor_load","temperature","vibration","acoustic_signature_index","torque_demand_index","motor_speed","texture_index","progress")} for x in rows]}
     finally:db.close()
 @app.post("/api/simulation/scenario")
 def configure(p:Scenario):

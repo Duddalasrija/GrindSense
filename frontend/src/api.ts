@@ -1,7 +1,7 @@
 export type Session={id:string;task_type:string;ingredients:string[];quantity:number;added_water_ml:number;preparation_type:string;jar_present:boolean;lid_locked:boolean;attachment_present:boolean;target_texture:string;smoothness_level:number;adaptive_mode:boolean;simulation_scenario:string;status:string;progress:number;started_at:string|null;completed_at:string|null;estimated_texture_score:number|null;result_summary:string|null};
-export type Reading={timestamp:string;motor_current:number;motor_load:number;temperature:number;vibration:number;motor_speed:number;texture_index:number;progress:number};
+export type Reading={timestamp:string;motor_current:number;motor_load:number;temperature:number;vibration:number;acoustic_signature_index:number;torque_demand_index:number;motor_speed:number;texture_index:number;progress:number};
 export type Event={timestamp:string;event_type:string;previous_state:Record<string,unknown>|null;new_state:Record<string,unknown>|null;severity:string;explanation:string};
-export type Results=Session&{duration_seconds:number|null;max_motor_load:number;max_temperature:number;adaptive_actions:number;telemetry:Reading[]};
+export type Results=Session&{duration_seconds:number|null;max_motor_load:number;max_temperature:number;max_acoustic_signature_index:number;max_torque_demand_index:number;adaptive_actions:number;telemetry:Reading[]};
 const BASE=(import.meta.env.VITE_API_URL||"http://localhost:8000").replace(/\/$/,"");
 async function request<T>(path:string,init?:RequestInit):Promise<T>{const r=await fetch(BASE+path,{...init,headers:{"Content-Type":"application/json",...init?.headers}});if(!r.ok){const e=await r.json().catch(()=>null);throw Error(e?.detail||`API error (${r.status})`)}return r.json()}
 export const api={
