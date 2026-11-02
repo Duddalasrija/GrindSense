@@ -1,0 +1,11 @@
+.event-badges{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.event-kind{font-size:8px;font-weight:600;color:#344139}
+.event-kind.predictive-warning{color:#8a5b0a}
+.event-kind.predictive-recovery{color:#16724f}
+.event-severity{display:inline-flex;align-items:center;border-radius:10px;padding:2px 6px;background:#eef1ed;color:#5d685f;font-size:7px;font-weight:600;line-height:1.4;text-transform:capitalize}
+.event-severity.severity-warning{background:#fff2d5;color:#805708}
+.event-severity.severity-critical{background:#fde8e4;color:#963d32}
+.event-severity.severity-info{background:#e8f4eb;color:#256448}
+.event-summary{display:grid;gap:5px}
+.event-pulse{font-size:8px;color:#526258;line-height:1.4}
+.safety-bar .event-badges{display:inline-flex;vertical-align:middle}

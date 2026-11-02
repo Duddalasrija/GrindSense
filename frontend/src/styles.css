@@ -83,3 +83,6 @@
  .prep-tabs{flex-wrap:wrap}
 }
 .pulse-card{padding:17px;border:1px solid var(--line);border-radius:13px;background:#fff}.pulse-card .section-title{margin-bottom:12px}.pulse-card .section-title small{color:var(--muted);font-size:8px;letter-spacing:.05em}.pulse-card>b{display:block;font-size:15px;color:var(--green)}.pulse-card>p{font-size:9px;color:var(--muted);line-height:1.45;margin:7px 0 0}
+
+/* Backend-connected simulated interlock controls */
+.interlock-card .section-title{margin-bottom:10px}.interlock-list{display:grid;gap:7px}.interlock-toggle{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:9px}.interlock-toggle>span{display:grid;gap:3px}.interlock-toggle small{font-size:8px;color:var(--muted)}.interlock-toggle input{accent-color:#159667}.interlock-warning,.interlock-error{padding:8px 10px;border-radius:8px;font-size:8px;line-height:1.45;margin:9px 0 0}.interlock-warning{background:#fff2d5;color:#805708}.interlock-error{background:#fde8e4;color:#963d32}

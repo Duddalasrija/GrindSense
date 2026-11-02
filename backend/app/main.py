@@ -1,10 +1,20 @@
-import asyncio, math, os, random, uuid
+import asyncio, logging, os, threading, uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import create_engine, Column, String, Float, Integer, Boolean, DateTime, ForeignKey, JSON, Text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from app.controller import (
+    PREDICTIVE_RESET_MARGIN,
+    PREDICTIVE_THRESHOLDS,
+    adapt,
+    predictive_warnings,
+    safety_stop_reason,
+    warning_reasons,
+)
+from app.simulation import generate_reading, texture_complete
 
 URL=os.getenv("GRINDSENSE_DATABASE_URL","sqlite:///./grindsense.db")
 engine=create_engine(URL,connect_args={"check_same_thread":False} if URL.startswith("sqlite") else {})
@@ -17,6 +27,9 @@ class GrindSession(Base):
     id=Column(String,primary_key=True); task_type=Column(String); ingredients=Column(JSON); quantity=Column(Float)
     target_texture=Column(String); smoothness_level=Column(Integer); adaptive_mode=Column(Boolean,default=True)
     added_water_ml=Column(Float,default=0); preparation_type=Column(String,default="Wet preparation")
+    jar_present=Column(Boolean,default=True,nullable=False,server_default="1")
+    lid_locked=Column(Boolean,default=True,nullable=False,server_default="1")
+    attachment_present=Column(Boolean,default=True,nullable=False,server_default="1")
     simulation_scenario=Column(String,default="normal"); scenario_seed=Column(Integer,default=42)
     status=Column(String,default="created"); progress=Column(Float,default=0); tick=Column(Integer,default=0)
     speed_rpm=Column(Float,default=900); intensity=Column(Float,default=.72); pulse_pattern=Column(String,default="3s on / 1s rest")
@@ -27,27 +40,104 @@ class GrindSession(Base):
 class Telemetry(Base):
     __tablename__="telemetry_records"
     id=Column(Integer,primary_key=True); session_id=Column(ForeignKey("grinding_sessions.id"),index=True); timestamp=Column(DateTime(timezone=True),default=now)
-    motor_current=Column(Float); motor_load=Column(Float); temperature=Column(Float); vibration=Column(Float); motor_speed=Column(Float); texture_index=Column(Float); progress=Column(Float)
+    motor_current=Column(Float); motor_load=Column(Float); temperature=Column(Float); vibration=Column(Float)
+    acoustic_signature_index=Column(Float,default=0,nullable=False,server_default="0")
+    torque_demand_index=Column(Float,default=0,nullable=False,server_default="0")
+    motor_speed=Column(Float); texture_index=Column(Float); progress=Column(Float)
 class Event(Base):
     __tablename__="session_events"
     id=Column(Integer,primary_key=True); session_id=Column(ForeignKey("grinding_sessions.id"),index=True); timestamp=Column(DateTime(timezone=True),default=now)
     event_type=Column(String); previous_state=Column(JSON); new_state=Column(JSON); severity=Column(String,default="info"); explanation=Column(Text)
 
 Base.metadata.create_all(engine)
-if URL.startswith("sqlite"):
-    with engine.begin() as conn:
+def ensure_sqlite_session_columns(database_engine):
+    """Add backward-compatible defaults for columns missing from old SQLite databases."""
+    with database_engine.begin() as conn:
         cols={row[1] for row in conn.exec_driver_sql("PRAGMA table_info(grinding_sessions)")}
-        if "added_water_ml" not in cols: conn.exec_driver_sql("ALTER TABLE grinding_sessions ADD COLUMN added_water_ml FLOAT NOT NULL DEFAULT 0")
-        if "preparation_type" not in cols: conn.exec_driver_sql("ALTER TABLE grinding_sessions ADD COLUMN preparation_type VARCHAR DEFAULT 'Wet preparation'")
+        additions={
+            "added_water_ml":"FLOAT NOT NULL DEFAULT 0",
+            "preparation_type":"VARCHAR DEFAULT 'Wet preparation'",
+            "jar_present":"BOOLEAN NOT NULL DEFAULT 1",
+            "lid_locked":"BOOLEAN NOT NULL DEFAULT 1",
+            "attachment_present":"BOOLEAN NOT NULL DEFAULT 1",
+        }
+        for name,definition in additions.items():
+            if name not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE grinding_sessions ADD COLUMN {name} {definition}")
+if URL.startswith("sqlite"): ensure_sqlite_session_columns(engine)
+def ensure_sqlite_telemetry_columns(database_engine):
+    """Add simulated acoustic and torque-proxy fields to existing SQLite telemetry."""
+    with database_engine.begin() as conn:
+        tables={row[0] for row in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "telemetry_records" not in tables:
+            return
+        cols={row[1] for row in conn.exec_driver_sql("PRAGMA table_info(telemetry_records)")}
+        additions={
+            "acoustic_signature_index":"FLOAT NOT NULL DEFAULT 0",
+            "torque_demand_index":"FLOAT NOT NULL DEFAULT 0",
+        }
+        for name,definition in additions.items():
+            if name not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE telemetry_records ADD COLUMN {name} {definition}")
+if URL.startswith("sqlite"): ensure_sqlite_telemetry_columns(engine)
 app=FastAPI(title="GrindSense Simulation API",version="1.0.0",description="Software-only prototype. Telemetry and outcomes are estimates; no hardware is connected.")
 origins=[x.strip() for x in os.getenv("GRINDSENSE_CORS_ORIGINS","http://localhost:5173").split(",")]
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_methods=["*"],allow_headers=["*"])
 tasks={}
+_session_locks={}
+_session_locks_guard=threading.Lock()
 scenario_default={"scenario":"normal","seed":42}
-TARGET={"coarse":28,"medium":52,"fine":76,"smooth":94}
-WARN_LOAD,WARN_TEMP,WARN_VIBE=78,72,7
-CRIT_LOAD,CRIT_TEMP,CRIT_VIBE,CRIT_CURRENT=96,88,11,11.5
 TICK=max(.25,float(os.getenv("GRINDSENSE_TICK_SECONDS","1")))
+logger=logging.getLogger(__name__)
+
+class _SessionLockEntry:
+    def __init__(self):
+        self.lock=asyncio.Lock()
+        self.references=0
+
+@asynccontextmanager
+async def session_guard(sid):
+    """Acquire a per-session lock without racing lock creation or reclamation."""
+    # Include the event loop in the key so sequential TestClient loops do not
+    # reuse an asyncio.Lock bound to a closed loop. Production remains single-loop.
+    key=(asyncio.get_running_loop(),sid)
+    with _session_locks_guard:
+        entry=_session_locks.get(key)
+        if entry is None:
+            entry=_SessionLockEntry()
+            _session_locks[key]=entry
+        entry.references+=1
+
+    acquired=False
+    try:
+        await entry.lock.acquire()
+        acquired=True
+        yield
+    finally:
+        if acquired:
+            entry.lock.release()
+        with _session_locks_guard:
+            entry.references-=1
+            if entry.references==0 and not entry.lock.locked() and _session_locks.get(key) is entry:
+                del _session_locks[key]
+
+@app.on_event("startup")
+def recover_running_sessions():
+    """Pause persisted sessions whose in-memory simulation tasks were lost at restart."""
+    db=DB()
+    try:
+        recovered=db.query(GrindSession).filter_by(status="running").all()
+        for s in recovered:
+            s.status="paused"
+            add_event(
+                db,s,"info",
+                "Application restarted; simulation paused. Resume explicitly to continue.",
+                old={"status":"running"},new={"status":"paused"},
+            )
+        if recovered:
+            db.commit()
+    finally:
+        db.close()
 
 class Create(BaseModel):
     task_type:str=Field(default="chutney",pattern="^(chutney|masala|batter|custom)$")
@@ -55,72 +145,223 @@ class Create(BaseModel):
     quantity:float=Field(default=250,gt=0,le=2000)
     added_water_ml:float=Field(default=0,ge=0,le=2000)
     preparation_type:str=Field(default="Wet preparation",pattern="^(Wet preparation|Dry grinding|Blending)$")
+    jar_present:bool=True
+    lid_locked:bool=True
+    attachment_present:bool=True
     target_texture:str=Field(default="medium",pattern="^(coarse|medium|fine|smooth)$")
     smoothness_level:int=Field(default=50,ge=0,le=100)
     adaptive_mode:bool=True
-    simulation_scenario:str=Field(default="normal",pattern="^(normal|high_load|high_temperature|high_vibration|overload)$")
+    simulation_scenario:str=Field(default="normal",pattern="^(normal|high_load|high_temperature|high_vibration|high_acoustic|overload)$")
     scenario_seed:int=42
+
+    @field_validator("ingredients")
+    @classmethod
+    def ingredient_names_must_not_be_blank(cls, ingredients):
+        if any(not ingredient.strip() for ingredient in ingredients):
+            raise ValueError("Ingredient names must not be empty or whitespace-only.")
+        return ingredients
+
 class Scenario(BaseModel):
-    scenario:str=Field(pattern="^(normal|high_load|high_temperature|high_vibration|overload)$")
+    scenario:str=Field(pattern="^(normal|high_load|high_temperature|high_vibration|high_acoustic|overload)$")
     seed:int=42
+class InterlockUpdate(BaseModel):
+    jar_present:bool
+    lid_locked:bool
+    attachment_present:bool
 def out(s):
-    return {k:getattr(s,k) for k in ("id","task_type","ingredients","quantity","added_water_ml","preparation_type","target_texture","smoothness_level","adaptive_mode","simulation_scenario","status","progress","started_at","completed_at","estimated_texture_score","result_summary")}
+    return {k:getattr(s,k) for k in ("id","task_type","ingredients","quantity","added_water_ml","preparation_type","jar_present","lid_locked","attachment_present","target_texture","smoothness_level","adaptive_mode","simulation_scenario","status","progress","started_at","completed_at","estimated_texture_score","result_summary")}
 def get(db,sid):
     s=db.get(GrindSession,sid)
     if not s: raise HTTPException(404,"Session not found")
     return s
 def add_event(db,s,kind,msg,severity="info",old=None,new=None):
     db.add(Event(session_id=s.id,event_type=kind,explanation=msg,severity=severity,previous_state=old,new_state=new))
-def generate(s):
-    rng=random.Random(s.scenario_seed+s.tick*7919)
-    task={"chutney":1,"masala":.92,"batter":.85,"custom":.95}.get(s.task_type,.95)
-    ingredients={"coconut":1.12,"chilli":1,"spices":.9,"lentils":1.14}
-    fac=task*sum(ingredients.get(i.lower(),1) for i in s.ingredients)/len(s.ingredients)
-    load=38+fac*14+math.sin(s.tick/5)*2.4+s.intensity*8+rng.uniform(-1.2,1.2)
-    temp=28+s.tick*(.22+s.intensity*.13)+max(0,load-60)*.12
-    vibe=2.1+abs(math.sin(s.tick/3))*1.1+max(0,load-65)*.07
-    if s.simulation_scenario=="high_load": load+=min(32,s.tick*1.3)
-    if s.simulation_scenario=="high_temperature": temp+=s.tick*.43
-    if s.simulation_scenario=="high_vibration": vibe+=min(9.5,s.tick*.38)
-    if s.simulation_scenario=="overload": load+=min(65,s.tick*2.7)
-    load=max(8,min(110,load))
-    progress=min(100,s.progress+(.60+s.intensity*.8)*(1.08 if s.simulation_scenario=="normal" else .85)*fac)
-    texture=min(100,progress*(.72+s.smoothness_level/250)*min(1.12,fac))
-    return dict(motor_current=round(1.2+load*.082+rng.uniform(-.1,.1),2),motor_load=round(load,1),temperature=round(temp,1),vibration=round(vibe,1),
-      motor_speed=round(max(300,s.speed_rpm*s.intensity+rng.uniform(-12,12))),texture_index=round(texture,1),progress=round(progress,1))
+def interlock_state(s):
+    return {"jar_present":s.jar_present,"lid_locked":s.lid_locked,"attachment_present":s.attachment_present}
+def unsafe_interlocks(s):
+    labels={"jar_present":"Jar is not present","lid_locked":"Lid is not locked","attachment_present":"Attachment is not present"}
+    return [labels[name] for name,value in interlock_state(s).items() if not value]
+def interlock_explanation(reasons):
+    return "Simulated safety interlock: " + "; ".join(reasons) + "."
+def record_interlock_stop(db,s,reasons,previous_state=None):
+    explanation=interlock_explanation(reasons) + " Grinding stopped safely."
+    old=previous_state or interlock_state(s)
+    s.status="safety_stopped";s.result_summary=explanation;s.completed_at=now()
+    add_event(db,s,"safety",explanation,"critical",old={**old,"status":"running"},new={**interlock_state(s),"status":"safety_stopped"})
+def block_interlock_start(db,s,reasons):
+    explanation=interlock_explanation(reasons) + " Session start was blocked."
+    state=interlock_state(s)
+    add_event(db,s,"safety",explanation,"critical",old=state,new={**state,"start_allowed":False})
+    db.commit()
+    raise HTTPException(409,explanation)
+def record_predictive_warnings(db,s,readings):
+    """Record one predictive warning per metric until its simulated value recovers."""
+    latest_state={}
+    for event in s.events:
+        if event.event_type not in ("predictive_warning","predictive_recovery") or not event.new_state:
+            continue
+        metric=event.new_state.get("metric")
+        if metric in PREDICTIVE_THRESHOLDS:
+            latest_state[metric]=event.new_state
+
+    current=readings[-1]
+    rearmed=set()
+    for metric, state in latest_state.items():
+        if state.get("status") != "active":
+            continue
+        reset_level=min(PREDICTIVE_THRESHOLDS[metric]) * (1 - PREDICTIVE_RESET_MARGIN)
+        if current[metric] <= reset_level:
+            explanation=(
+                f"Simulated {metric.replace('_', ' ')} recovered below its predictive warning reset margin. "
+                "A later rising trend may generate another predictive warning."
+            )
+            add_event(
+                db, s, "predictive_recovery", explanation, "info",
+                old=state, new={"metric": metric, "status": "recovered", "reset_level": reset_level},
+            )
+            rearmed.add(metric)
+
+    for prediction in predictive_warnings(readings):
+        if prediction.metric in rearmed:
+            continue
+        state=latest_state.get(prediction.metric)
+        if state and state.get("status") == "active":
+            reset_level=min(PREDICTIVE_THRESHOLDS[prediction.metric]) * (1 - PREDICTIVE_RESET_MARGIN)
+            if current[prediction.metric] > reset_level:
+                continue
+        explanation=(
+            f"PREDICTIVE WARNING: Simulated {prediction.metric.replace('_', ' ')} is rising "
+            f"({prediction.slope_per_tick:.2f} units per simulation tick) and may approach "
+            f"the configured threshold {prediction.threshold:g} in approximately "
+            f"{prediction.estimated_ticks_to_threshold:.1f} ticks."
+        )
+        add_event(
+            db, s, "predictive_warning", explanation, "warning",
+            old={"metric": prediction.metric, "value": current[prediction.metric]},
+            new={
+                "metric": prediction.metric,
+                "status": "active",
+                "threshold": prediction.threshold,
+                "slope_per_tick": round(prediction.slope_per_tick, 4),
+                "estimated_ticks_to_threshold": round(prediction.estimated_ticks_to_threshold, 2),
+            },
+        )
 def advance(db,s):
-    s.tick+=1; r=generate(s); old={"speed_rpm":s.speed_rpm,"pulse_pattern":s.pulse_pattern,"intensity":s.intensity}; msg=None
+    reasons=unsafe_interlocks(s)
+    if reasons:
+        record_interlock_stop(db,s,reasons)
+        return
+    s.tick+=1; r=generate_reading(s); old={"speed_rpm":s.speed_rpm,"pulse_pattern":s.pulse_pattern,"intensity":s.intensity}
     if s.adaptive_mode:
-        if r["temperature"]>=WARN_TEMP and s.intensity>.52:
-            s.intensity=.48;s.speed_rpm=max(420,s.speed_rpm-120);s.pulse_pattern="2s on / 2s rest";msg="Temperature rising. Reducing simulated intensity and extending rest pulses."
-        elif r["motor_load"]>=WARN_LOAD and s.intensity>.45:
-            s.intensity=.43;s.speed_rpm=max(420,s.speed_rpm-150);s.pulse_pattern="2s on / 2s rest";msg="High grinding resistance detected. Adjusting simulated speed and pulse pattern."
-        elif r["vibration"]>=WARN_VIBE and s.intensity>.4:
-            s.intensity=.38;s.pulse_pattern="1s on / 2s rest";msg="Elevated simulated vibration detected. Using shorter pulses."
-        elif r["motor_load"]<62 and s.progress<70 and s.intensity<.82:
-            s.intensity=min(.82,s.intensity+.04);msg="Load is stable and texture progress is low. Gradually increasing simulated intensity."
-        if msg:add_event(db,s,"adaptive",msg,old=old,new={"speed_rpm":s.speed_rpm,"pulse_pattern":s.pulse_pattern,"intensity":s.intensity})
+        decision=adapt(s,r)
+        s.speed_rpm=decision.speed_rpm;s.intensity=decision.intensity;s.pulse_pattern=decision.pulse_pattern
+        if decision.explanation:add_event(db,s,"adaptive",decision.explanation,old=old,new={"speed_rpm":s.speed_rpm,"pulse_pattern":s.pulse_pattern,"intensity":s.intensity})
+    previous_rows=(
+        db.query(Telemetry)
+        .filter_by(session_id=s.id)
+        .order_by(Telemetry.id.desc())
+        .limit(4)
+        .all()
+    )
+    recent_readings=[
+        {key:getattr(row,key) for key in ("motor_load","temperature","vibration","motor_current","acoustic_signature_index")}
+        for row in reversed(previous_rows)
+    ]
+    recent_readings.append(r)
     db.add(Telemetry(session_id=s.id,**r));s.progress=r["progress"]
-    if r["temperature"]>=WARN_TEMP and not any(e.event_type=="warning" and "temperature" in e.explanation for e in s.events):add_event(db,s,"warning","Simulated temperature warning; demo threshold only.","warning")
-    if r["vibration"]>=WARN_VIBE and not any(e.event_type=="warning" and "vibration" in e.explanation for e in s.events):add_event(db,s,"warning","Simulated vibration warning; demo threshold only.","warning")
-    reason=("Critical simulated temperature threshold reached; session stopped safely." if r["temperature"]>=CRIT_TEMP else
-      "Critical simulated vibration threshold reached; session stopped safely." if r["vibration"]>=CRIT_VIBE else
-      "Simulated overload condition detected; session stopped safely." if r["motor_load"]>=CRIT_LOAD or r["motor_current"]>=CRIT_CURRENT else None)
+    record_predictive_warnings(db,s,recent_readings)
+    for key,message in warning_reasons(r):
+        if not any(e.event_type=="warning" and key in e.explanation.lower() for e in s.events):add_event(db,s,"warning",message,"warning")
+    reason=safety_stop_reason(r)
     if reason:
         s.status="safety_stopped";s.result_summary=reason;s.completed_at=now();add_event(db,s,"safety",reason,"critical")
-    elif r["texture_index"]>=TARGET[s.target_texture]:
+    elif texture_complete(s.target_texture,r["texture_index"]):
         s.status="completed";s.estimated_texture_score=r["texture_index"];s.result_summary="Estimated target outcome achieved in software simulation.";s.completed_at=now();add_event(db,s,"info",s.result_summary)
     elif s.tick>=180:
         s.status="completed";s.estimated_texture_score=r["texture_index"];s.result_summary="Simulation time limit reached; result is an estimate.";s.completed_at=now()
-async def run(sid):
-    while True:
-        await asyncio.sleep(TICK);db=DB()
+async def simulation_tick(sid):
+    """Run one tick only if the session is still running under its session lock."""
+    async with session_guard(sid):
+        db=DB()
         try:
             s=db.get(GrindSession,sid)
-            if not s or s.status!="running":return
-            advance(db,s);db.commit()
-            if s.status!="running":return
-        finally:db.close()
+            if not s or s.status!="running":
+                return False
+            advance(db,s)
+            db.commit()
+            return s.status=="running"
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+async def _pause_after_task_error(sid,exc):
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=db.get(GrindSession,sid)
+            if s and s.status=="running":
+                s.status="paused"
+                explanation=(
+                    f"Simulation task failed with {type(exc).__name__}; "
+                    "the session was paused. See backend logs for details."
+                )
+                add_event(
+                    db,s,"error",explanation,"warning",
+                    old={"status":"running"},new={"status":"paused"},
+                )
+                db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Could not pause session %s after a simulation task failure",sid)
+        finally:
+            db.close()
+
+async def _remove_task_if_current(sid,task):
+    async with session_guard(sid):
+        if tasks.get(sid) is task:
+            del tasks[sid]
+
+async def _cancel_and_wait(sid,task):
+    """Cancel a task after its session lock is released, then await cleanup."""
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Simulation task ended unexpectedly")
+    finally:
+        # Also covers a task cancelled before its coroutine got its first turn.
+        await _remove_task_if_current(sid,task)
+
+def _ensure_task_locked(sid):
+    """Return the session's active task or create one; caller holds its lock."""
+    task=tasks.get(sid)
+    if task is not None and not task.done():
+        return task
+    task=asyncio.create_task(run(sid),name=f"grindsense:{sid}")
+    tasks[sid]=task
+    return task
+
+async def run(sid):
+    task=asyncio.current_task()
+    try:
+        while True:
+            await asyncio.sleep(TICK)
+            if not await simulation_tick(sid):
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Simulation task failed for session %s",sid)
+        await _pause_after_task_error(sid,exc)
+    finally:
+        await _remove_task_if_current(sid,task)
 @app.get("/api/health")
 def health():return {"status":"ok","mode":"simulation","hardware_connected":False}
 @app.post("/api/sessions",status_code=201)
@@ -144,28 +385,48 @@ def session(sid:str):
     finally:db.close()
 @app.post("/api/sessions/{sid}/start")
 async def start(sid:str):
-    db=DB()
-    try:
-        s=get(db,sid)
-        if s.status in ("completed","safety_stopped"):raise HTTPException(409,"Finished session cannot be restarted.")
-        if s.status!="running":
-            s.status="running";s.started_at=s.started_at or now();db.commit()
-            if sid not in tasks or tasks[sid].done():tasks[sid]=asyncio.create_task(run(sid))
-        return out(s)
-    finally:db.close()
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=get(db,sid)
+            if s.status in ("completed","safety_stopped","stopped"):
+                raise HTTPException(409,"Finished session cannot be restarted.")
+            reasons=unsafe_interlocks(s)
+            if reasons:
+                block_interlock_start(db,s,reasons)
+            if s.status!="running":
+                s.status="running"
+                s.started_at=s.started_at or now()
+                db.commit()
+            # The running state is committed before a task is registered or scheduled.
+            _ensure_task_locked(sid)
+            return out(s)
+        finally:
+            db.close()
 @app.post("/api/sessions/{sid}/stop")
-def stop(sid:str):
-    db=DB()
-    try:
-        s=get(db,sid)
-        if s.status=="running":
-            s.status="stopped";s.completed_at=now();s.result_summary="Simulation stopped by user.";add_event(db,s,"info",s.result_summary);db.commit()
-        return out(s)
-    finally:db.close()
+async def stop(sid:str):
+    task=None
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=get(db,sid)
+            if s.status in ("running","paused"):
+                previous_status=s.status
+                s.status="stopped";s.completed_at=now();s.result_summary="Simulation stopped by user."
+                add_event(
+                    db,s,"info",s.result_summary,
+                    old={"status":previous_status},new={"status":"stopped"},
+                )
+                db.commit()
+                task=tasks.get(sid)
+            response=out(s)
+        finally:db.close()
+    await _cancel_and_wait(sid,task)
+    return response
 @app.get("/api/sessions/{sid}/telemetry")
 def telemetry(sid:str):
     db=DB()
-    try:get(db,sid);return [{k:getattr(r,k) for k in ("timestamp","motor_current","motor_load","temperature","vibration","motor_speed","texture_index","progress")} for r in db.query(Telemetry).filter_by(session_id=sid).order_by(Telemetry.id)]
+    try:get(db,sid);return [{k:getattr(r,k) for k in ("timestamp","motor_current","motor_load","temperature","vibration","acoustic_signature_index","torque_demand_index","motor_speed","texture_index","progress")} for r in db.query(Telemetry).filter_by(session_id=sid).order_by(Telemetry.id)]
     finally:db.close()
 @app.get("/api/sessions/{sid}/events")
 def events(sid:str):
@@ -179,7 +440,9 @@ def results(sid:str):
         s=get(db,sid);rows=db.query(Telemetry).filter_by(session_id=sid).order_by(Telemetry.id).all()
         return {**out(s),"duration_seconds":(s.completed_at.replace(tzinfo=timezone.utc)-s.started_at.replace(tzinfo=timezone.utc)).total_seconds() if s.completed_at and s.started_at else None,
           "max_motor_load":max((x.motor_load for x in rows),default=0),"max_temperature":max((x.temperature for x in rows),default=0),
-          "adaptive_actions":db.query(Event).filter_by(session_id=sid,event_type="adaptive").count(),"telemetry":[{k:getattr(x,k) for k in ("timestamp","motor_current","motor_load","temperature","vibration","motor_speed","texture_index","progress")} for x in rows]}
+          "max_acoustic_signature_index":max((x.acoustic_signature_index for x in rows),default=0),
+          "max_torque_demand_index":max((x.torque_demand_index for x in rows),default=0),
+          "adaptive_actions":db.query(Event).filter_by(session_id=sid,event_type="adaptive").count(),"telemetry":[{k:getattr(x,k) for k in ("timestamp","motor_current","motor_load","temperature","vibration","acoustic_signature_index","torque_demand_index","motor_speed","texture_index","progress")} for x in rows]}
     finally:db.close()
 @app.post("/api/simulation/scenario")
 def configure(p:Scenario):
@@ -188,25 +451,56 @@ def configure(p:Scenario):
 
 @app.post("/api/sessions/{sid}/pause")
 async def pause(sid:str):
-    db=DB()
-    try:
-        s=get(db,sid)
-        if s.status=="running":
-            task=tasks.get(sid)
-            if task and not task.done(): task.cancel()
-            s.status="paused"
-            add_event(db,s,"info","Simulation paused by user.")
-            db.commit()
-        return out(s)
-    finally: db.close()
+    task=None
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=get(db,sid)
+            if s.status=="running":
+                s.status="paused"
+                add_event(db,s,"info","Simulation paused by user.")
+                db.commit()
+                task=tasks.get(sid)
+            response=out(s)
+        finally: db.close()
+    await _cancel_and_wait(sid,task)
+    return response
 @app.post("/api/sessions/{sid}/resume")
 async def resume(sid:str):
-    db=DB()
-    try:
-        s=get(db,sid)
-        if s.status!="paused": raise HTTPException(409,"Only a paused session can be resumed.")
-        s.status="running"
-        db.commit()
-        tasks[sid]=asyncio.create_task(run(sid))
-        return out(s)
-    finally: db.close()
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=get(db,sid)
+            if s.status!="paused": raise HTTPException(409,"Only a paused session can be resumed.")
+            reasons=unsafe_interlocks(s)
+            if reasons:block_interlock_start(db,s,reasons)
+            s.status="running"
+            db.commit()
+            _ensure_task_locked(sid)
+            return out(s)
+        finally: db.close()
+
+@app.post("/api/sessions/{sid}/interlocks")
+async def update_interlocks(sid:str,payload:InterlockUpdate):
+    task=None
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=get(db,sid)
+            if s.status in ("completed","safety_stopped","stopped"):
+                raise HTTPException(409,"Finished session interlocks cannot be changed.")
+            old=interlock_state(s)
+            s.jar_present=payload.jar_present;s.lid_locked=payload.lid_locked;s.attachment_present=payload.attachment_present
+            reasons=unsafe_interlocks(s)
+            if reasons and s.status=="running":
+                record_interlock_stop(db,s,reasons,previous_state=old)
+                task=tasks.get(sid)
+            elif reasons:
+                add_event(db,s,"warning",interlock_explanation(reasons)+" Session cannot start until all components are safe.","warning",old=old,new=interlock_state(s))
+            else:
+                add_event(db,s,"info","Simulated interlock states updated; all components are safe.",old=old,new=interlock_state(s))
+            db.commit()
+            response=out(s)
+        finally: db.close()
+    await _cancel_and_wait(sid,task)
+    return response
