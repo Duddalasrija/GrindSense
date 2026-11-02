@@ -1,8 +1,9 @@
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import create_engine
 
-from app.controller import adapt, safety_stop_reason, warning_reasons
+from app.controller import adapt, predictive_warnings, safety_stop_reason, warning_reasons
 from app.simulation import TEXTURE_THRESHOLDS, generate_reading, texture_complete
 
 
@@ -125,3 +126,78 @@ def test_same_seed_and_state_generate_identical_readings():
 def test_unknown_texture_is_rejected():
     with pytest.raises(ValueError, match="Unsupported target texture"):
         texture_complete("silky", 100)
+
+
+@pytest.mark.parametrize(
+    ("metric", "values", "threshold"),
+    [
+        ("motor_load", [72, 74, 76], 78),
+        ("temperature", [66, 68, 70], 72),
+        ("vibration", [5.5, 5.9, 6.4], 7),
+        ("motor_current", [9.5, 10.0, 10.7], 11.5),
+    ],
+)
+def test_rising_metrics_predict_configured_threshold_approach(metric, values, threshold):
+    readings = [reading(**{metric: value}) for value in values]
+    predictions = predictive_warnings(readings)
+    prediction = next(item for item in predictions if item.metric == metric)
+    assert prediction.threshold == threshold
+    assert prediction.slope_per_tick > 0
+    assert 0 < prediction.estimated_ticks_to_threshold <= 3
+
+
+@pytest.mark.parametrize("values", [[60, 60, 60, 60, 60], [60, 61, 62, 63, 64]])
+def test_stable_or_slowly_rising_values_without_near_threshold_crossing_do_not_predict(values):
+    predictions = predictive_warnings([reading(motor_load=value) for value in values])
+    assert not any(item.metric == "motor_load" for item in predictions)
+
+
+def test_falling_values_do_not_predict():
+    predictions = predictive_warnings([reading(motor_load=value) for value in [76, 74, 72, 70, 68]])
+    assert not any(item.metric == "motor_load" for item in predictions)
+
+
+def test_fewer_than_three_readings_do_not_predict():
+    predictions = predictive_warnings([reading(motor_load=value) for value in [72, 76]])
+    assert not predictions
+
+
+def test_single_noisy_spike_does_not_predict():
+    predictions = predictive_warnings([reading(motor_load=value) for value in [70, 70, 70, 70, 77]])
+    assert not any(item.metric == "motor_load" for item in predictions)
+
+
+def test_prediction_at_exactly_three_ticks_is_included_and_later_crossing_is_excluded():
+    exact = predictive_warnings([reading(motor_load=value) for value in [63, 66, 69]])
+    prediction = next(item for item in exact if item.metric == "motor_load")
+    assert prediction.threshold == 78
+    assert prediction.estimated_ticks_to_threshold == pytest.approx(3)
+
+    beyond = predictive_warnings([reading(motor_load=value) for value in [60, 63, 66]])
+    assert not any(item.metric == "motor_load" for item in beyond)
+
+
+def test_only_latest_five_readings_influence_prediction():
+    values = [110, 0, 110, 0, 70, 72, 74, 76, 77]
+    predictions = predictive_warnings([reading(motor_load=value) for value in values])
+    prediction = next(item for item in predictions if item.metric == "motor_load")
+    assert prediction.slope_per_tick == pytest.approx(1.8)
+    assert prediction.estimated_ticks_to_threshold == pytest.approx(1 / 1.8)
+
+
+def test_existing_sqlite_session_rows_get_safe_interlock_defaults():
+    from app.main import ensure_sqlite_session_columns
+
+    legacy_engine = create_engine("sqlite://")
+    try:
+        with legacy_engine.begin() as connection:
+            connection.exec_driver_sql("CREATE TABLE grinding_sessions (id VARCHAR PRIMARY KEY)")
+        ensure_sqlite_session_columns(legacy_engine)
+        with legacy_engine.begin() as connection:
+            connection.exec_driver_sql("INSERT INTO grinding_sessions (id) VALUES ('legacy-session')")
+            values = connection.exec_driver_sql(
+                "SELECT jar_present, lid_locked, attachment_present FROM grinding_sessions WHERE id='legacy-session'"
+            ).one()
+        assert values == (1, 1, 1)
+    finally:
+        legacy_engine.dispose()
