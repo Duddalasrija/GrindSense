@@ -1,8 +1,9 @@
-import asyncio, os, uuid
+import asyncio, logging, os, threading, uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import create_engine, Column, String, Float, Integer, Boolean, DateTime, ForeignKey, JSON, Text
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from app.controller import (
@@ -65,8 +66,60 @@ app=FastAPI(title="GrindSense Simulation API",version="1.0.0",description="Softw
 origins=[x.strip() for x in os.getenv("GRINDSENSE_CORS_ORIGINS","http://localhost:5173").split(",")]
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_methods=["*"],allow_headers=["*"])
 tasks={}
+_session_locks={}
+_session_locks_guard=threading.Lock()
 scenario_default={"scenario":"normal","seed":42}
 TICK=max(.25,float(os.getenv("GRINDSENSE_TICK_SECONDS","1")))
+logger=logging.getLogger(__name__)
+
+class _SessionLockEntry:
+    def __init__(self):
+        self.lock=asyncio.Lock()
+        self.references=0
+
+@asynccontextmanager
+async def session_guard(sid):
+    """Acquire a per-session lock without racing lock creation or reclamation."""
+    # Include the event loop in the key so sequential TestClient loops do not
+    # reuse an asyncio.Lock bound to a closed loop. Production remains single-loop.
+    key=(asyncio.get_running_loop(),sid)
+    with _session_locks_guard:
+        entry=_session_locks.get(key)
+        if entry is None:
+            entry=_SessionLockEntry()
+            _session_locks[key]=entry
+        entry.references+=1
+
+    acquired=False
+    try:
+        await entry.lock.acquire()
+        acquired=True
+        yield
+    finally:
+        if acquired:
+            entry.lock.release()
+        with _session_locks_guard:
+            entry.references-=1
+            if entry.references==0 and not entry.lock.locked() and _session_locks.get(key) is entry:
+                del _session_locks[key]
+
+@app.on_event("startup")
+def recover_running_sessions():
+    """Pause persisted sessions whose in-memory simulation tasks were lost at restart."""
+    db=DB()
+    try:
+        recovered=db.query(GrindSession).filter_by(status="running").all()
+        for s in recovered:
+            s.status="paused"
+            add_event(
+                db,s,"info",
+                "Application restarted; simulation paused. Resume explicitly to continue.",
+                old={"status":"running"},new={"status":"paused"},
+            )
+        if recovered:
+            db.commit()
+    finally:
+        db.close()
 
 class Create(BaseModel):
     task_type:str=Field(default="chutney",pattern="^(chutney|masala|batter|custom)$")
@@ -82,6 +135,14 @@ class Create(BaseModel):
     adaptive_mode:bool=True
     simulation_scenario:str=Field(default="normal",pattern="^(normal|high_load|high_temperature|high_vibration|overload)$")
     scenario_seed:int=42
+
+    @field_validator("ingredients")
+    @classmethod
+    def ingredient_names_must_not_be_blank(cls, ingredients):
+        if any(not ingredient.strip() for ingredient in ingredients):
+            raise ValueError("Ingredient names must not be empty or whitespace-only.")
+        return ingredients
+
 class Scenario(BaseModel):
     scenario:str=Field(pattern="^(normal|high_load|high_temperature|high_vibration|overload)$")
     seed:int=42
@@ -200,15 +261,89 @@ def advance(db,s):
         s.status="completed";s.estimated_texture_score=r["texture_index"];s.result_summary="Estimated target outcome achieved in software simulation.";s.completed_at=now();add_event(db,s,"info",s.result_summary)
     elif s.tick>=180:
         s.status="completed";s.estimated_texture_score=r["texture_index"];s.result_summary="Simulation time limit reached; result is an estimate.";s.completed_at=now()
-async def run(sid):
-    while True:
-        await asyncio.sleep(TICK);db=DB()
+async def simulation_tick(sid):
+    """Run one tick only if the session is still running under its session lock."""
+    async with session_guard(sid):
+        db=DB()
         try:
             s=db.get(GrindSession,sid)
-            if not s or s.status!="running":return
-            advance(db,s);db.commit()
-            if s.status!="running":return
-        finally:db.close()
+            if not s or s.status!="running":
+                return False
+            advance(db,s)
+            db.commit()
+            return s.status=="running"
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+async def _pause_after_task_error(sid,exc):
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=db.get(GrindSession,sid)
+            if s and s.status=="running":
+                s.status="paused"
+                explanation=(
+                    f"Simulation task failed with {type(exc).__name__}; "
+                    "the session was paused. See backend logs for details."
+                )
+                add_event(
+                    db,s,"error",explanation,"warning",
+                    old={"status":"running"},new={"status":"paused"},
+                )
+                db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Could not pause session %s after a simulation task failure",sid)
+        finally:
+            db.close()
+
+async def _remove_task_if_current(sid,task):
+    async with session_guard(sid):
+        if tasks.get(sid) is task:
+            del tasks[sid]
+
+async def _cancel_and_wait(sid,task):
+    """Cancel a task after its session lock is released, then await cleanup."""
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Simulation task ended unexpectedly")
+    finally:
+        # Also covers a task cancelled before its coroutine got its first turn.
+        await _remove_task_if_current(sid,task)
+
+def _ensure_task_locked(sid):
+    """Return the session's active task or create one; caller holds its lock."""
+    task=tasks.get(sid)
+    if task is not None and not task.done():
+        return task
+    task=asyncio.create_task(run(sid),name=f"grindsense:{sid}")
+    tasks[sid]=task
+    return task
+
+async def run(sid):
+    task=asyncio.current_task()
+    try:
+        while True:
+            await asyncio.sleep(TICK)
+            if not await simulation_tick(sid):
+                return
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Simulation task failed for session %s",sid)
+        await _pause_after_task_error(sid,exc)
+    finally:
+        await _remove_task_if_current(sid,task)
 @app.get("/api/health")
 def health():return {"status":"ok","mode":"simulation","hardware_connected":False}
 @app.post("/api/sessions",status_code=201)
@@ -232,26 +367,44 @@ def session(sid:str):
     finally:db.close()
 @app.post("/api/sessions/{sid}/start")
 async def start(sid:str):
-    db=DB()
-    try:
-        s=get(db,sid)
-        if s.status in ("completed","safety_stopped"):raise HTTPException(409,"Finished session cannot be restarted.")
-        reasons=unsafe_interlocks(s)
-        if reasons:block_interlock_start(db,s,reasons)
-        if s.status!="running":
-            s.status="running";s.started_at=s.started_at or now();db.commit()
-            if sid not in tasks or tasks[sid].done():tasks[sid]=asyncio.create_task(run(sid))
-        return out(s)
-    finally:db.close()
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=get(db,sid)
+            if s.status in ("completed","safety_stopped","stopped"):
+                raise HTTPException(409,"Finished session cannot be restarted.")
+            reasons=unsafe_interlocks(s)
+            if reasons:
+                block_interlock_start(db,s,reasons)
+            if s.status!="running":
+                s.status="running"
+                s.started_at=s.started_at or now()
+                db.commit()
+            # The running state is committed before a task is registered or scheduled.
+            _ensure_task_locked(sid)
+            return out(s)
+        finally:
+            db.close()
 @app.post("/api/sessions/{sid}/stop")
-def stop(sid:str):
-    db=DB()
-    try:
-        s=get(db,sid)
-        if s.status=="running":
-            s.status="stopped";s.completed_at=now();s.result_summary="Simulation stopped by user.";add_event(db,s,"info",s.result_summary);db.commit()
-        return out(s)
-    finally:db.close()
+async def stop(sid:str):
+    task=None
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=get(db,sid)
+            if s.status in ("running","paused"):
+                previous_status=s.status
+                s.status="stopped";s.completed_at=now();s.result_summary="Simulation stopped by user."
+                add_event(
+                    db,s,"info",s.result_summary,
+                    old={"status":previous_status},new={"status":"stopped"},
+                )
+                db.commit()
+                task=tasks.get(sid)
+            response=out(s)
+        finally:db.close()
+    await _cancel_and_wait(sid,task)
+    return response
 @app.get("/api/sessions/{sid}/telemetry")
 def telemetry(sid:str):
     db=DB()
@@ -278,49 +431,56 @@ def configure(p:Scenario):
 
 @app.post("/api/sessions/{sid}/pause")
 async def pause(sid:str):
-    db=DB()
-    try:
-        s=get(db,sid)
-        if s.status=="running":
-            task=tasks.get(sid)
-            if task and not task.done(): task.cancel()
-            s.status="paused"
-            add_event(db,s,"info","Simulation paused by user.")
-            db.commit()
-        return out(s)
-    finally: db.close()
+    task=None
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=get(db,sid)
+            if s.status=="running":
+                s.status="paused"
+                add_event(db,s,"info","Simulation paused by user.")
+                db.commit()
+                task=tasks.get(sid)
+            response=out(s)
+        finally: db.close()
+    await _cancel_and_wait(sid,task)
+    return response
 @app.post("/api/sessions/{sid}/resume")
 async def resume(sid:str):
-    db=DB()
-    try:
-        s=get(db,sid)
-        if s.status!="paused": raise HTTPException(409,"Only a paused session can be resumed.")
-        reasons=unsafe_interlocks(s)
-        if reasons:block_interlock_start(db,s,reasons)
-        s.status="running"
-        db.commit()
-        tasks[sid]=asyncio.create_task(run(sid))
-        return out(s)
-    finally: db.close()
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=get(db,sid)
+            if s.status!="paused": raise HTTPException(409,"Only a paused session can be resumed.")
+            reasons=unsafe_interlocks(s)
+            if reasons:block_interlock_start(db,s,reasons)
+            s.status="running"
+            db.commit()
+            _ensure_task_locked(sid)
+            return out(s)
+        finally: db.close()
 
 @app.post("/api/sessions/{sid}/interlocks")
 async def update_interlocks(sid:str,payload:InterlockUpdate):
-    db=DB()
-    try:
-        s=get(db,sid)
-        if s.status in ("completed","safety_stopped","stopped"):
-            raise HTTPException(409,"Finished session interlocks cannot be changed.")
-        old=interlock_state(s)
-        s.jar_present=payload.jar_present;s.lid_locked=payload.lid_locked;s.attachment_present=payload.attachment_present
-        reasons=unsafe_interlocks(s)
-        if reasons and s.status=="running":
-            task=tasks.get(sid)
-            if task and not task.done(): task.cancel()
-            record_interlock_stop(db,s,reasons,previous_state=old)
-        elif reasons:
-            add_event(db,s,"warning",interlock_explanation(reasons)+" Session cannot start until all components are safe.","warning",old=old,new=interlock_state(s))
-        else:
-            add_event(db,s,"info","Simulated interlock states updated; all components are safe.",old=old,new=interlock_state(s))
-        db.commit()
-        return out(s)
-    finally: db.close()
+    task=None
+    async with session_guard(sid):
+        db=DB()
+        try:
+            s=get(db,sid)
+            if s.status in ("completed","safety_stopped","stopped"):
+                raise HTTPException(409,"Finished session interlocks cannot be changed.")
+            old=interlock_state(s)
+            s.jar_present=payload.jar_present;s.lid_locked=payload.lid_locked;s.attachment_present=payload.attachment_present
+            reasons=unsafe_interlocks(s)
+            if reasons and s.status=="running":
+                record_interlock_stop(db,s,reasons,previous_state=old)
+                task=tasks.get(sid)
+            elif reasons:
+                add_event(db,s,"warning",interlock_explanation(reasons)+" Session cannot start until all components are safe.","warning",old=old,new=interlock_state(s))
+            else:
+                add_event(db,s,"info","Simulated interlock states updated; all components are safe.",old=old,new=interlock_state(s))
+            db.commit()
+            response=out(s)
+        finally: db.close()
+    await _cancel_and_wait(sid,task)
+    return response
