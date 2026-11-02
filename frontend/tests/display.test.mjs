@@ -45,3 +45,31 @@ test("elapsed time and display use the UTC instant accurately", () => {
   assert.equal(helpers.elapsedSeconds(start, now), 72);
   assert.equal(helpers.formatDuration(helpers.elapsedSeconds(start, now)), "01:12");
 });
+
+test("interlock updates preserve the complete simulated state payload", () => {
+  const state = { jar_present: true, lid_locked: true, attachment_present: true };
+  assert.deepEqual(helpers.updateInterlockState(state, "lid_locked", false), {
+    jar_present: true, lid_locked: false, attachment_present: true,
+  });
+  assert.deepEqual(helpers.unsafeInterlockLabels({ ...state, jar_present: false, attachment_present: false }), [
+    "Jar present", "Attachment present",
+  ]);
+  assert.deepEqual(helpers.unsafeInterlockLabels(state), []);
+});
+
+test("adaptive pulse patterns are returned only for valid adaptive event values", () => {
+  assert.equal(helpers.adaptivePulsePattern("adaptive", { pulse_pattern: "2s on / 2s rest" }), "2s on / 2s rest");
+  assert.equal(helpers.adaptivePulsePattern("adaptive", null), null);
+  assert.equal(helpers.adaptivePulsePattern("adaptive", {}), null);
+  assert.equal(helpers.adaptivePulsePattern("adaptive", { pulse_pattern: null }), null);
+  assert.equal(helpers.adaptivePulsePattern("adaptive", { pulse_pattern: 42 }), null);
+  assert.equal(helpers.adaptivePulsePattern("info", { pulse_pattern: "ignored" }), null);
+});
+
+test("event severity safely handles absent and invalid backend values", () => {
+  assert.equal(helpers.safeEventSeverity("critical"), "critical");
+  assert.equal(helpers.safeEventSeverity("future-level"), "future-level");
+  assert.equal(helpers.safeEventSeverity(null), "Info");
+  assert.equal(helpers.safeEventSeverity(42), "Info");
+  assert.equal(helpers.safeEventSeverity("  "), "Info");
+});
