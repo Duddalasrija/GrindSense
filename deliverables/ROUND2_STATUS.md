@@ -2,9 +2,9 @@
 
 ## Scope
 
-This review follows the approved AtomQuest 2026 Track 3 Mixer Grinder abstract supplied by the project owner. The abstract describes an outcome driven cycle: choose coarse, medium, fine, or smooth; sense; interpret; adapt; verify; stop. Its proposed inputs include motor current, vibration, acoustic signature, temperature, and jar/lid/attachment state. The current project is a software simulation only.
+This review follows the owner-approved Track 3 mixer-grinder concept. It describes an outcome-driven cycle: choose coarse, medium, fine, or smooth; sense; interpret; adapt; verify; stop. Proposed inputs include motor current, vibration, acoustic signature, temperature, and jar/lid/attachment state. The current project is a software simulation only.
 
-## Implemented in this branch
+## Implemented in the current main revision
 
 - React + TypeScript + Vite dashboard communicates with the FastAPI + SQLite backend.
 - Backend generates changing simulated readings and run state.
@@ -29,8 +29,8 @@ All sensor values, thresholds, warnings, texture scores, adaptive actions, inter
 
 1. Demo the four outcomes and the normal, high-acoustic, and overload scenarios; capture dated screenshots or a recording of actual runs and note the scenario used.
 2. Check pause/resume/stop, each interlock, warning, results, and history in the running UI; report untested flows honestly.
-3. Obtain Sahithi's exact latest frontend branch/commit and review its diff before integration; it is not available in this checkout.
-4. Finish the abstract's conceptual CAD package (housing, jar, blade, lid, assembly, exploded view, proposed sensing/interlock locations) and capture genuine CAD screenshots. CAD is unfinished and no sensor installation should be implied.
+3. Obtain Sahithi's exact latest frontend branch/commit and review its diff before integration. The contributor-linked repository currently exposes only its older `main`; no newer frontend work was found.
+4. Finish the conceptual CAD package (housing, jar, blade, lid, assembly, exploded view, proposed sensing/interlock locations) and capture genuine CAD screenshots. CAD is unfinished and no sensor installation should be implied.
 5. Keep a concise limitations slide/report in the submission and preserve the no-hardware disclaimer.
 
 ## Round 3 / later validation

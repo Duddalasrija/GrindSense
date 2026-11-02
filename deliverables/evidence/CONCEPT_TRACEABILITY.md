@@ -1,4 +1,4 @@
-# Abstract traceability
+# Approved concept traceability
 
 | Approved concept item | Current status | Evidence / limitation |
 |---|---|---|
